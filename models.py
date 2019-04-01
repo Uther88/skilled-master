@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from aiohttp import log
 import datetime
 import json
+from secrets import token_urlsafe
 
 
 client = motor.motor_asyncio.AsyncIOMotorClient(settings.DB['host'], settings.DB['port'])
@@ -13,16 +14,6 @@ db = client[settings.DB['name']]
 
 db.users.create_index(keys="username", unique=True)
 db.channels.create_index(keys="name", unique=True)
-
-
-
-async def get_next_id(collection_name, step=1):
-    result = await db.counters.find_one_and_update(
-        filter={"_id": collection_name},
-        update={"$inc": {"next": step}},
-        upsert=True, new=True
-    )
-    return result["next"]
 
 
 @dataclass(init=True)
@@ -60,17 +51,30 @@ class BaseModel:
 
     # Create new object
     @classmethod
-    async def create(cls, **kwargs):
-        new_id = await get_next_id(cls.Meta.collection)
+    async def create(cls, kwargs):
+        new_id = await cls._get_next_id()
         kwargs['_id'] = new_id
         if cls.is_valid(kwargs):
             try:
                 new_obj = cls(**kwargs)
                 new = await db[cls.Meta.collection].insert_one(new_obj.__dict__)
-                return cls.get(new.inserted_id)
+                return await cls.get(new.inserted_id)
             except Exception as e:
-                await get_next_id(cls.Meta.collection, step=-1)
+                await cls._get_next_id(step=-1)
                 log.web_logger.error(e)
+
+    @classmethod
+    async def _get_next_id(cls, step=1):
+
+        """ Get next id from counters collection on creating new object """
+
+        result = await db.counters.find_one_and_update(
+            filter={"_id": cls.Meta.collection},
+            update={"$inc": {"next": step}},
+            upsert=True, new=True
+        )
+        if step > 0:
+            return result["next"]
 
     # Modify exists object
     @classmethod
@@ -80,9 +84,8 @@ class BaseModel:
 
     # Delete object
     @classmethod
-    async def delete(cls, **kwargs):
-        await db[cls.Meta.collection].delete_one(kwargs)
-
+    async def delete(cls, kwargs):
+        await db[cls.Meta.collection].delete_one(**kwargs)
 
     # Check for valid data
     @classmethod
@@ -99,7 +102,7 @@ class BaseModel:
     def to_json(self):
         d = dict()
         for a, v in self.__dict__.items():
-            if (hasattr(v, "to_json")):
+            if hasattr(v, "to_json"):
                 d[a] = v.to_json()
             else:
                 d[a] = v
@@ -142,18 +145,57 @@ class User(BaseModel):
 
     class Meta:
         collection = 'users'
-        required_fields = ['username', 'name', 'surname', 'patronymic', 'position', 'channel']
+        required_fields = ['username', 'password', 'name', 'surname', 'patronymic', 'position', 'channel']
         related_fields = {
             'channel': Channel
         }
 
+    # Set coordinates of user place
     async def set_coordinates(self, coordinates):
         if type(coordinates) == list:
             await self.update(self.id, coordinates=coordinates)
 
+    # Set master is busy
     async def set_busy(self, busy):
         if type(busy) == bool:
             await self.update(self.id, is_busy=busy)
+
+    @classmethod
+    async def create(cls, kwargs):
+        password = kwargs.get('password')
+        user = await cls.create(**kwargs)
+        token = token_urlsafe()
+        api_key = await db.api_keys.insert_one(
+            dict(
+                user_id=user.id,
+                username=user.username,
+                password=password,
+                token=token
+            )
+        )
+        if api_key:
+            return user
+
+    @classmethod
+    async def login(cls, username, password):
+
+        """ Authorize login in pass and set token to user instance  """
+
+        auth_data = await db.api_keys.find_one(dict(username=username, password=password))
+        if auth_data:
+            user = await cls.get(_id=auth_data.get('user_id'))
+            user.token = auth_data.get('token')
+            return user
+
+    @classmethod
+    async def get_by_token(cls, token):
+
+        """ Get user instance by token """
+
+        auth_data = await db.api_keys.find_one({'token': token})
+        if auth_data:
+            user = await cls.get(auth_data.get('user_id'))
+            return user
 
 
 @dataclass
@@ -168,7 +210,7 @@ class Request(BaseModel):
         default_factory=lambda: {"income": 0, "expense": 0, "total": 0, "percent": 0, "to_firm": 0, "to_master": 0})
     is_viewed: bool = False
     in_progress: bool = False
-    date: str = datetime.datetime.now()
+    date: str = datetime.datetime.now().strftime('%Y-%m-%dT%H:%M')
 
     class Meta:
         collection = 'requests'

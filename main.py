@@ -12,10 +12,7 @@ import jinja2
 from aiohttp import web, log
 import sys
 
-from routes import routes
-from middlewares import get_user_factory
-import settings
-import models
+from handlers import routes
 
 
 if sys.platform not in ('win32',):
@@ -27,23 +24,26 @@ async def static_processor(request):
     return {'STATIC_URL': '/static/'}
 
 
-async def auth_processor(request):
-    return {'user': request.user}
-
-
 class BList(list):
-	
-    def send_data(self, resource, data):
-        log.ws_logger.info("Sending {} for {} waiters".format(resource, len(self)))
+
+    """ Broadcast list """
+
+    # Send data to waiters
+    async def send_data(self, resource, data):
+
+        # Create queue of tasks
+        tasks = []
         for waiter in self:
-            try:
-                waiter.send_json({resource: data})
-            except Exception:
-                log.ws_logger.error('Error was happened during broadcasting: ', exec_info=True)
+            tasks.append(waiter['ws'].send_json({resource: data.to_json()}))
+        try:
+            # Run all task gather
+            asyncio.gather(*tasks, return_exceptions=True)
+        except Exception as e:
+            log.ws_logger.error('Error was happened during broadcasting: %s' % e)
 
 
 async def get_app(debug=False):
-    middlewares = [get_user_factory]
+    middlewares = []
 
     if debug:
         middlewares += [toolbar_middleware_factory]
@@ -54,26 +54,21 @@ async def get_app(debug=False):
         aiohttp_debugtoolbar.setup(app, intercept_redirects=False)
 
     router = app.router
-    for route in routes:
-        router.add_route(route[0], route[1], route[2])
+    router.add_routes(routes)
     router.add_static('/static', 'static')
 
     aiohttp_jinja2.setup(
         app, loader=jinja2.FileSystemLoader('templates'),
-        context_processors=[static_processor, auth_processor]
+        context_processors=[static_processor]
     )
 
-    app['masters'] = defaultdict(BList)
-    app['curators'] = defaultdict(BList)
+    app['waiters'] = defaultdict(BList)
 
+    # Close all websockets form broadcast list
     async def close_websockets(app):
-        for master in app['masters'].values():
-            for ws in master:
-                await ws.close(code=1000, message="Server shutdown")
-
-        for curator in app['curators'].values():
-            for ws in curator:
-                await ws.close(code=1000, message="Server shutdown")
+        for channel in app['waiters'].values():
+            for waiter in channel:
+                await waiter['ws'].close(code=1000, message="Server shutdown")
 
     app.on_shutdown.append(close_websockets)
 
