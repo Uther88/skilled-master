@@ -79,7 +79,7 @@ if __name__ == '__main__':
     debug = True
 
     if debug:
-        logging.basicConfig(level='DEBUG')
+        logging.basicConfig(level='DEBUG', filename="logging.log", filemode='w')
 
     loop = asyncio.get_event_loop()
     app = loop.run_until_complete(get_app(debug))

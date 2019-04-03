@@ -54,15 +54,18 @@ class WebSocketView(web.View):
     """ WebSocket for handling requests """
 
     async def get(self):
-        # Get token from url match and user by token
+        # Get user instance by matching token
+
         token = self.request.match_info.get('token')
         user = await User.get_by_token(token)
 
-        # Get channel id from url match and channel by id
+        # Get channel instance by matching id
+
         channel_id = self.request.match_info.get('channel')
         channel = await Channel.get(channel_id)
 
-        # If user and channel ok - channel access check
+        # Check for user belong to chat. Staff users have access to any channel
+
         if user and channel:
             if not user.is_staff and user.channel.id != channel.id:
                 return web.Response(text="User does not belong to this channel", status=403)
@@ -70,6 +73,7 @@ class WebSocketView(web.View):
             waiters = self.request.app['waiters'][channel.id]
             try:
                 # Prepare websocket and add user and ws to waiters list
+
                 ws = web.WebSocketResponse(autoclose=False)
                 await ws.prepare(self.request)
                 waiters.append({'user': user, 'ws': ws})
@@ -83,6 +87,7 @@ class WebSocketView(web.View):
                             try:
                                 data = msg.json()
                             except Exception as e:
+                                ws.send_str('Data must be in correct json format')
                                 log.ws_logger.error('Error on handling data: %s' % e)
                             else:
                                 # Handle actions
@@ -93,13 +98,15 @@ class WebSocketView(web.View):
                         log.ws_logger.error(
                             'ws connection closed with exception %s' % ws.exception()
                             )
+
             # Close websocket and remove it from channel
+
             finally:
-                for w in waiters:
-                    if w['ws'] == ws:
+                for waiter in waiters:
+                    if waiter['ws'] == ws:
                         await ws.close(code=1000, message="Connection closed")
                         log.ws_logger.info('Is WebSocket closed?: {}'.format(ws.closed))
-                        waiters.remove(w)
+                        waiters.remove(waiter)
             return ws
         else:
             return web.Response(text="Bad request", status=400)

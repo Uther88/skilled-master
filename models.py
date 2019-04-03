@@ -1,33 +1,104 @@
 # models.py
 
-import settings
-import motor.motor_asyncio
-from dataclasses import dataclass, field
-from aiohttp import log
 import datetime
-import json
 from secrets import token_urlsafe
+from dataclasses import dataclass, field
+
+import motor.motor_asyncio
+from aiohttp import log
+
+import settings
 
 
-client = motor.motor_asyncio.AsyncIOMotorClient(settings.DB['host'], settings.DB['port'])
-db = client[settings.DB['name']]
+def get_db(host="localhost", port=27017, name="main"):
+    """ Connector to database (mongodb)
 
-db.users.create_index(keys="username", unique=True)
-db.channels.create_index(keys="name", unique=True)
+    :param name: (default main)
+    :param host: (default localhost)
+    :param port: (default 27017)
+    :return: database
+
+    """
+    client = motor.motor_asyncio.AsyncIOMotorClient(host, port)
+    database = client[name]
+
+    db.users.create_index(keys="username", unique=True)
+    db.channels.create_index(keys="name", unique=True)
+    return database
 
 
-@dataclass(init=True)
+db = get_db(settings.DB['host'], settings.DB['port'], settings.DB['name'])
+
+
+async def get_next_id(cls, step=1, counters='counters'):
+    """ Get next id
+
+    Increase collections counter on creating object
+    Counter will be decreased if step is negative
+
+    :param cls: model class
+    :param step: (default 1)
+    :param counters: (default counters) counters collection name
+    :return: next index or None
+
+    """
+
+    result = await cls.Meta.db[counters].find_one_and_update(
+        filter={"_id": cls.Meta.collection},
+        update={"$inc": {"next": step}},
+        upsert=True, new=True
+    )
+    if step > 0:
+        return result["next"]
+
+
+def token_creator(func):
+
+    """ Create token in api_keys collection on User creating """
+
+    async def wrapped(*args, **kwargs):
+        password = kwargs.pop('password')
+        user = await func(*args, **kwargs)
+        if user:
+            token = token_urlsafe()
+            api_key = await db.api_keys.insert_one(
+                dict(
+                    user_id=user.id,
+                    username=user.username,
+                    password=password,
+                    token=token
+                )
+            )
+            if api_key:
+                return user
+    return wrapped
+
+
+def token_remover(func):
+
+    """ Remove token and auth data from api_keys on User deleting """
+
+    async def wrapped(*args, **kwargs):
+        user_id = await func(*args, **kwargs)
+        if user_id:
+            result = await db.api_keys.delete_one({'user_id': user_id})
+            return result
+    return wrapped
+
+
+@dataclass
 class BaseModel:
     """ 
     The base class of the model that implements the data interface
+
     """
 
     _id: int
 
-    # Get single object from db
+    # Get single object
     @classmethod
     async def get(cls, _id):
-        data = await db[cls.Meta.collection].find_one({'_id': int(_id)})
+        data = await cls.Meta.db[cls.Meta.collection].find_one({'_id': int(_id)})
         if data:
             obj = await cls(**data).prepare_related()
             return obj
@@ -46,46 +117,36 @@ class BaseModel:
     # Get many objects with default limit = 100 and optional filtration
     @classmethod
     async def all(cls, limit=100, **kwargs):
-        data = await db[cls.Meta.collection].find(kwargs).to_list(limit)
+        data = await cls.Meta.db[cls.Meta.collection].find(kwargs).to_list(limit)
         return [await cls(**kw).prepare_related() for kw in data]
 
     # Create new object
     @classmethod
-    async def create(cls, kwargs):
-        new_id = await cls._get_next_id()
+    async def create(cls, **kwargs):
+        new_id = await get_next_id(cls)
         kwargs['_id'] = new_id
         if cls.is_valid(kwargs):
             try:
                 new_obj = cls(**kwargs)
-                new = await db[cls.Meta.collection].insert_one(new_obj.__dict__)
+                new = await cls.Meta.db[cls.Meta.collection].insert_one(new_obj.__dict__)
                 return await cls.get(new.inserted_id)
             except Exception as e:
-                await cls._get_next_id(step=-1)
+                await get_next_id(cls, step=-1)
                 log.web_logger.error(e)
-
-    @classmethod
-    async def _get_next_id(cls, step=1):
-
-        """ Get next id from counters collection on creating new object """
-
-        result = await db.counters.find_one_and_update(
-            filter={"_id": cls.Meta.collection},
-            update={"$inc": {"next": step}},
-            upsert=True, new=True
-        )
-        if step > 0:
-            return result["next"]
+        else:
+            print(kwargs)
 
     # Modify exists object
     @classmethod
     async def update(cls, _id, **kwargs):
-        await db[cls.Meta.collection].update_one({'_id': _id}, {'$set': kwargs})
+        await cls.Meta.db[cls.Meta.collection].update_one({'_id': _id}, {'$set': kwargs})
         return await cls.get(_id)
 
     # Delete object
     @classmethod
-    async def delete(cls, kwargs):
-        await db[cls.Meta.collection].delete_one(**kwargs)
+    async def delete(cls, _id):
+        await cls.Meta.db[cls.Meta.collection].delete_one({'_id': _id})
+        return _id
 
     # Check for valid data
     @classmethod
@@ -94,25 +155,25 @@ class BaseModel:
             cls(**data)
         except Exception as e:
             log.web_logger.error(e)
-            return False
         else:
             return True
 
     # Convert model to dict
     def to_json(self):
-        d = dict()
+        data = dict()
         for a, v in self.__dict__.items():
             if hasattr(v, "to_json"):
-                d[a] = v.to_json()
+                data[a] = v.to_json()
             else:
-                d[a] = v
-        return d
+                data[a] = v
+        return data
 
     @property
     def id(self):
         return self._id
 
     class Meta:
+        db = db
         collection = 'default'
         required_fields = []
         related_fields = {}
@@ -123,6 +184,7 @@ class Channel(BaseModel):
     name: str
 
     class Meta:
+        db = db
         collection = 'channels'
         required_fields = ['name']
         related_fields = {}
@@ -145,6 +207,7 @@ class User(BaseModel):
 
     class Meta:
         collection = 'users'
+        db = db
         required_fields = ['username', 'password', 'name', 'surname', 'patronymic', 'position', 'channel']
         related_fields = {
             'channel': Channel
@@ -161,27 +224,23 @@ class User(BaseModel):
             await self.update(self.id, is_busy=busy)
 
     @classmethod
-    async def create(cls, kwargs):
-        password = kwargs.get('password')
-        user = await cls.create(**kwargs)
-        token = token_urlsafe()
-        api_key = await db.api_keys.insert_one(
-            dict(
-                user_id=user.id,
-                username=user.username,
-                password=password,
-                token=token
-            )
-        )
-        if api_key:
-            return user
+    @token_creator
+    async def create(cls, **kwargs):
+        user = await super().create(**kwargs)
+        return user
+
+    @classmethod
+    @token_remover
+    async def delete(cls, _id):
+        result = await super().delete(_id)
+        return result
 
     @classmethod
     async def login(cls, username, password):
 
         """ Authorize login in pass and set token to user instance  """
 
-        auth_data = await db.api_keys.find_one(dict(username=username, password=password))
+        auth_data = await cls.Meta.db.api_keys.find_one(dict(username=username, password=password))
         if auth_data:
             user = await cls.get(_id=auth_data.get('user_id'))
             user.token = auth_data.get('token')
@@ -192,7 +251,7 @@ class User(BaseModel):
 
         """ Get user instance by token """
 
-        auth_data = await db.api_keys.find_one({'token': token})
+        auth_data = await cls.Meta.db.api_keys.find_one({'token': token})
         if auth_data:
             user = await cls.get(auth_data.get('user_id'))
             return user
@@ -205,7 +264,7 @@ class Request(BaseModel):
     master: User = None
     completed: dict = field(default_factory=lambda: {"is": False, "date": None})
     info: dict = field(default_factory=dict)
-    denie: dict = field(default_factory=lambda: {"is": False, "who": None, "comment": None})
+    denied: dict = field(default_factory=lambda: {"is": False, "who": None, "comment": None})
     finance: dict = field(
         default_factory=lambda: {"income": 0, "expense": 0, "total": 0, "percent": 0, "to_firm": 0, "to_master": 0})
     is_viewed: bool = False
@@ -213,6 +272,7 @@ class Request(BaseModel):
     date: str = datetime.datetime.now().strftime('%Y-%m-%dT%H:%M')
 
     class Meta:
+        db = db
         collection = 'requests'
         required_fields = ['channel', "info", "date"]
         related_fields = {
@@ -231,6 +291,7 @@ class Message(BaseModel):
     is_new: bool = True
 
     class Meta:
+        db = db
         collection = 'messages'
         required_fields = ['sender', 'recipient', 'text']
         related_fields = {
