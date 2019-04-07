@@ -1,89 +1,12 @@
 # models.py
 
 import datetime
-from secrets import token_urlsafe
 from dataclasses import dataclass, field
 
-import motor.motor_asyncio
 from aiohttp import log
 
-import settings
-
-
-def get_db(host="localhost", port=27017, name="main"):
-    """ Connector to database (mongodb)
-
-    :param name: (default main)
-    :param host: (default localhost)
-    :param port: (default 27017)
-    :return: database
-
-    """
-    client = motor.motor_asyncio.AsyncIOMotorClient(host, port)
-    database = client[name]
-
-    db.users.create_index(keys="username", unique=True)
-    db.channels.create_index(keys="name", unique=True)
-    return database
-
-
-db = get_db(settings.DB['host'], settings.DB['port'], settings.DB['name'])
-
-
-async def get_next_id(cls, step=1, counters='counters'):
-    """ Get next id
-
-    Increase collections counter on creating object
-    Counter will be decreased if step is negative
-
-    :param cls: model class
-    :param step: (default 1)
-    :param counters: (default counters) counters collection name
-    :return: next index or None
-
-    """
-
-    result = await cls.Meta.db[counters].find_one_and_update(
-        filter={"_id": cls.Meta.collection},
-        update={"$inc": {"next": step}},
-        upsert=True, new=True
-    )
-    if step > 0:
-        return result["next"]
-
-
-def token_creator(func):
-
-    """ Create token in api_keys collection on User creating """
-
-    async def wrapped(*args, **kwargs):
-        password = kwargs.pop('password')
-        user = await func(*args, **kwargs)
-        if user:
-            token = token_urlsafe()
-            api_key = await db.api_keys.insert_one(
-                dict(
-                    user_id=user.id,
-                    username=user.username,
-                    password=password,
-                    token=token
-                )
-            )
-            if api_key:
-                return user
-    return wrapped
-
-
-def token_remover(func):
-
-    """ Remove token and auth data from api_keys on User deleting """
-
-    async def wrapped(*args, **kwargs):
-        user_id = await func(*args, **kwargs)
-        if user_id:
-            result = await db.api_keys.delete_one({'user_id': user_id})
-            return result
-    return wrapped
+from settings import db
+from utils import token_creator, token_remover, get_next_id
 
 
 @dataclass
@@ -128,13 +51,12 @@ class BaseModel:
         if cls.is_valid(kwargs):
             try:
                 new_obj = cls(**kwargs)
-                new = await cls.Meta.db[cls.Meta.collection].insert_one(new_obj.__dict__)
-                return await cls.get(new.inserted_id)
+                new = await cls.Meta.db[cls.Meta.collection].insert_one(vars(new_obj))
+                n = await cls.get(new.inserted_id)
+                return n
             except Exception as e:
                 await get_next_id(cls, step=-1)
-                log.web_logger.error(e)
-        else:
-            print(kwargs)
+                log.server_logger.error(f'Error during create { cls.__name__ } : { e }')
 
     # Modify exists object
     @classmethod
@@ -145,8 +67,12 @@ class BaseModel:
     # Delete object
     @classmethod
     async def delete(cls, _id):
-        await cls.Meta.db[cls.Meta.collection].delete_one({'_id': _id})
-        return _id
+        obj = await cls.get(_id)
+        if obj:
+            await cls.Meta.db[cls.Meta.collection].delete_one({'_id': obj.id})
+            return obj
+        else:
+            log.server_logger('Error on delete {}'.format(cls.__name__))
 
     # Check for valid data
     @classmethod
@@ -161,7 +87,9 @@ class BaseModel:
     # Convert model to dict
     def to_json(self):
         data = dict()
-        for a, v in self.__dict__.items():
+        if hasattr(self, 'full_name'):
+            data['full_name'] = self.full_name
+        for a, v in vars(self).items():
             if hasattr(v, "to_json"):
                 data[a] = v.to_json()
             else:
@@ -188,6 +116,9 @@ class Channel(BaseModel):
         collection = 'channels'
         required_fields = ['name']
         related_fields = {}
+
+    def __str__(self):
+        return self.name
 
 
 @dataclass
@@ -226,8 +157,8 @@ class User(BaseModel):
     @classmethod
     @token_creator
     async def create(cls, **kwargs):
-        user = await super().create(**kwargs)
-        return user
+        result = await super().create(**kwargs)
+        return result
 
     @classmethod
     @token_remover
@@ -255,6 +186,13 @@ class User(BaseModel):
         if auth_data:
             user = await cls.get(auth_data.get('user_id'))
             return user
+
+    @property
+    def full_name(self):
+        return f'{self.surname} {self.name[0]}. {self.patronymic[0]}.'
+
+    def __str__(self):
+        return self.full_name
 
 
 @dataclass

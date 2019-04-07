@@ -13,6 +13,7 @@ from aiohttp import web, log
 import sys
 
 from handlers import routes
+import settings
 
 
 if sys.platform not in ('win32',):
@@ -83,4 +84,4 @@ if __name__ == '__main__':
 
     loop = asyncio.get_event_loop()
     app = loop.run_until_complete(get_app(debug))
-    web.run_app(app)
+    web.run_app(app, host=settings.HOST, port=settings.PORT)
